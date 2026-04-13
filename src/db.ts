@@ -3,8 +3,11 @@ const ObjectId = Schema.Types.ObjectId;
 
 interface IUser extends Document {
     username:string;
-    password:string;
-    email:{type:string,unique:true};
+    password?:string;
+    email:string;
+    provider: "local" | "google" | "github";
+    providerId?: string;
+    avatar?: string;
     _id: Types.ObjectId;
 }
 
@@ -30,8 +33,11 @@ interface ILinks extends Document {
 
 const UserSchema = new Schema<IUser>({
     username: { type: String, required: true, unique: true },
-    password: { type: String, required: true },
-    email: { type: String, unique: true }
+    password: { type: String },
+    email: { type: String, unique: true, required: true },
+    provider: { type: String, enum: ["local", "google", "github"], default: "local" },
+    providerId: { type: String },
+    avatar: { type: String }
 })
 
 
@@ -51,7 +57,7 @@ const ContentsSchema = new Schema<IContents>({
 
 
 const LinksSchema = new Schema<ILinks>({
-    hash: { type: String, required: true },
+    hash: { type: String, required: true, unique: true },
     user: { type: ObjectId, ref: 'user', required: true }       
 })
 

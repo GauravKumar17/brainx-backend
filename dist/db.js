@@ -38,8 +38,11 @@ const mongoose_1 = __importStar(require("mongoose"));
 const ObjectId = mongoose_1.Schema.Types.ObjectId;
 const UserSchema = new mongoose_1.Schema({
     username: { type: String, required: true, unique: true },
-    password: { type: String, required: true },
-    email: { type: String, unique: true }
+    password: { type: String },
+    email: { type: String, unique: true, required: true },
+    provider: { type: String, enum: ["local", "google", "github"], default: "local" },
+    providerId: { type: String },
+    avatar: { type: String }
 });
 const TagsSchema = new mongoose_1.Schema({
     title: { type: String, unique: true, required: true }
@@ -53,7 +56,7 @@ const ContentsSchema = new mongoose_1.Schema({
     uploadedAt: { type: Date, default: Date.now }
 });
 const LinksSchema = new mongoose_1.Schema({
-    hash: { type: String, required: true },
+    hash: { type: String, required: true, unique: true },
     user: { type: ObjectId, ref: 'user', required: true }
 });
 const userModel = mongoose_1.default.model('user', UserSchema);

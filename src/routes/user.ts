@@ -3,19 +3,41 @@ dotenv.config()
 import express, { Request, Response, NextFunction,RequestHandler } from 'express';
 import { z } from 'zod';
 import bcrypt from 'bcrypt';
-import JWT from 'jsonwebtoken';
-const JWT_SECRET = process.env.JWT_SECRET;
+import crypto from 'crypto';
 
-import { userModel, tagsModel, contentModel, linksModel } from '../db';
+import { userModel, contentModel, linksModel } from '../db';
+import { signAuthToken, getFrontendUrl } from '../auth';
+import { passport, isStrategyConfigured } from '../passport';
 
 import { authMiddleware } from './middleware';
 const userRouter = express.Router();
+
+function buildOAuthRedirect(token: string, username: string) {
+    const frontendUrl = getFrontendUrl();
+    const params = new URLSearchParams({
+        token,
+        username
+    });
+
+    return `${frontendUrl}/auth/callback?${params.toString()}`;
+}
+
+function ensureOAuthStrategy(strategy: "google" | "github", res: Response) {
+    if (!isStrategyConfigured(strategy)) {
+        res.status(503).json({
+            message: `${strategy} authentication is not configured on the server. Add the required OAuth client ID and secret in backend/.env and restart the backend.`
+        });
+        return false;
+    }
+
+    return true;
+}
 
 
 
 //----------------------------------Signup Route------------------------------------------
 
-userRouter.post('/signup', (async(req:Request,res:Response , next:NextFunction)=> {
+userRouter.post('/signup', (async(req:Request,res:Response , _next:NextFunction)=> {
 
     // Check if user already exists
     const email = req.body.email;
@@ -56,19 +78,13 @@ try{
     const user = await userModel.create({
         email:email,
         username:username,
-        password:hashedPassword
+        password:hashedPassword,
+        provider: "local"
     })
 
     //  to signin the user from signuppage directly we need to create a JWT token to letter check the user is authenticated or not
 
-    if(!JWT_SECRET) {
-        console.error("JWT_SECRET is not defined in your environment.");
-        return res.status(500).json({ message: "Internal server error" });
-        }
-
-        const token = JWT.sign({
-            userId:user._id.toString(),
-        },JWT_SECRET);
+        const token = signAuthToken(user._id);
 
         return res.status(200).json({
             message:"Signup successful",
@@ -86,7 +102,7 @@ try{
 //----------------------------------Signin Route------------------------------------------
 
 
-userRouter.post('/signin', (async(req:Request,res:Response,next:NextFunction)=>{
+userRouter.post('/signin', (async(req:Request,res:Response,_next:NextFunction)=>{
     try{
         const email = req.body.email;
         const password = req.body.password;
@@ -100,18 +116,16 @@ userRouter.post('/signin', (async(req:Request,res:Response,next:NextFunction)=>{
             })
         }
 
+        if (!user.password) {
+            return res.status(400).json({
+                message:"This account uses social login. Continue with Google or GitHub."
+            })
+        }
+
         const verifypasword  = await bcrypt.compare(password,user.password);
 
         if(verifypasword){
-            // Check if JWT_SECRET is defined in env or not(this is compulsory in ts)
-            if (!JWT_SECRET) {
-                console.error("JWT_SECRET is not defined in your environment.");
-                return res.status(500).json({ message: "Internal server error" });
-            }
-
-            const token = JWT.sign({
-                userId:user._id.toString(),
-                },JWT_SECRET);
+            const token = signAuthToken(user._id);
 
                 console.log("User signed in successfully:", user.username)
             return res.status(200).json({
@@ -136,7 +150,7 @@ userRouter.post('/signin', (async(req:Request,res:Response,next:NextFunction)=>{
 //----------------------------------Add Contents Route------------------------------------------
 
 
-userRouter.post('/contents', authMiddleware, (async (req: Request, res: Response , next:NextFunction) => {
+userRouter.post('/contents', authMiddleware, (async (req: Request, res: Response , _next:NextFunction) => {
 
     try{
         const link = req.body.link;
@@ -169,14 +183,24 @@ userRouter.post('/contents', authMiddleware, (async (req: Request, res: Response
 //----------------------------------Get Contents Route------------------------------------------
 
 
-userRouter.get('/contents', authMiddleware, (async (req: Request, res: Response , next:NextFunction) => {
-    
+userRouter.get('/contents', authMiddleware, (async (req: Request, res: Response , _next:NextFunction) => {
     try{
-       
         const userId = req.userId;
-        const contents = await contentModel.find({
+        const searchQuery = typeof req.query.q === 'string' ? req.query.q.trim() : undefined;
+
+        const filter: Record<string, unknown> = {
             userId: userId
-        }).populate('userId', 'username') //since reference to User model
+        };
+
+        if (searchQuery) {
+            filter.$or = [
+                { title: { $regex: searchQuery, $options: 'i' } },
+                { link: { $regex: searchQuery, $options: 'i' } },
+                { type: { $regex: searchQuery, $options: 'i' } }
+            ];
+        }
+
+        const contents = await contentModel.find(filter).populate('userId', 'username').sort({ uploadedAt: -1 });
 
         return res.status(200).json({
             contents: contents
@@ -187,22 +211,89 @@ userRouter.get('/contents', authMiddleware, (async (req: Request, res: Response 
 })as RequestHandler);
 
 
+//----------------------------------OAuth Routes------------------------------------------
+
+userRouter.get(
+    '/auth/google',
+    ((req: Request, res: Response, next: NextFunction) => {
+        if (!ensureOAuthStrategy("google", res)) {
+            return;
+        }
+
+        return (passport.authenticate('google', { scope: ['profile', 'email'], session: false }) as RequestHandler)(req, res, next);
+    }) as RequestHandler
+);
+
+userRouter.get(
+    '/auth/google/callback',
+    ((req: Request, res: Response, next: NextFunction) => {
+        if (!ensureOAuthStrategy("google", res)) {
+            return;
+        }
+
+        return (passport.authenticate('google', { session: false, failureRedirect: `${getFrontendUrl()}/?authError=google` }) as RequestHandler)(req, res, next);
+    }) as RequestHandler,
+    ((req: Request, res: Response) => {
+        const user = req.user as typeof req.user & { _id: { toString(): string }, username?: string } | undefined;
+
+        if (!user) {
+            return res.redirect(`${getFrontendUrl()}/?authError=google`);
+        }
+
+        const token = signAuthToken(user._id.toString());
+        return res.redirect(buildOAuthRedirect(token, user.username ?? "User"));
+    }) as RequestHandler
+);
+
+userRouter.get(
+    '/auth/github',
+    ((req: Request, res: Response, next: NextFunction) => {
+        if (!ensureOAuthStrategy("github", res)) {
+            return;
+        }
+
+        return (passport.authenticate('github', { scope: ['user:email'], session: false }) as RequestHandler)(req, res, next);
+    }) as RequestHandler
+);
+
+userRouter.get(
+    '/auth/github/callback',
+    ((req: Request, res: Response, next: NextFunction) => {
+        if (!ensureOAuthStrategy("github", res)) {
+            return;
+        }
+
+        return (passport.authenticate('github', { session: false, failureRedirect: `${getFrontendUrl()}/?authError=github` }) as RequestHandler)(req, res, next);
+    }) as RequestHandler,
+    ((req: Request, res: Response) => {
+        const user = req.user as typeof req.user & { _id: { toString(): string }, username?: string } | undefined;
+
+        if (!user) {
+            return res.redirect(`${getFrontendUrl()}/?authError=github`);
+        }
+
+        const token = signAuthToken(user._id.toString());
+        return res.redirect(buildOAuthRedirect(token, user.username ?? "User"));
+    }) as RequestHandler
+);
+
+
 
 //----------------------------------Delete Contents Route------------------------------------------
 
 
-userRouter.delete('/contents/:id', authMiddleware,(async (req: Request, res: Response , next:NextFunction) => {
+userRouter.delete('/contents/:id', authMiddleware,(async (req: Request, res: Response , _next:NextFunction) => {
     try{
         const contentId = req.params.id;
         
         const userId = req.userId;
 
-        const content = await contentModel.deleteMany({
+        const content = await contentModel.deleteOne({
             _id: contentId,
             userId: userId
         });
 
-        if (!content) {
+        if (content.deletedCount === 0) {
             return res.status(404).json({
                 message: "Content not found or unauthorized"
             });
@@ -221,14 +312,47 @@ userRouter.delete('/contents/:id', authMiddleware,(async (req: Request, res: Res
 
 //----------------------------------Share Contents Route------------------------------------------
 
-userRouter.post('/share', (async (req: Request, res: Response , next:NextFunction) => {
-    
+userRouter.post('/share', authMiddleware, (async (req: Request, res: Response , next:NextFunction) => {
+    try {
+        const userId = req.userId;
+
+        let shareLink = await linksModel.findOne({ user: userId });
+        if (!shareLink) {
+            const hash = crypto.randomBytes(8).toString('hex');
+            shareLink = await linksModel.create({ hash, user: userId });
+        }
+
+        const shareUrl = `${getFrontendUrl()}/share/${shareLink.hash}`;
+
+        return res.status(200).json({
+            shareUrl,
+            message: "Share link created successfully"
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Internal server error", error: err });
+    }
 })as RequestHandler);
 
 //----------------------------------Get Shared Links Route------------------------------------------
 
-userRouter.get('/:shareLink', (async (req: Request, res: Response , next:NextFunction) => {
-    
+userRouter.get('/share/:shareLink', (async (req: Request, res: Response , next:NextFunction) => {
+    try {
+        const shareLink = req.params.shareLink;
+
+        const link = await linksModel.findOne({ hash: shareLink }).populate('user', 'username');
+        if (!link) {
+            return res.status(404).json({ message: "Share link not found" });
+        }
+
+        const contents = await contentModel.find({ userId: link.user }).sort({ uploadedAt: -1 });
+
+        return res.status(200).json({
+            contents,
+            sharedBy: (link.user as any)?.username ?? "Unknown"
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Internal server error", error: err });
+    }
 })as RequestHandler);
 
 
